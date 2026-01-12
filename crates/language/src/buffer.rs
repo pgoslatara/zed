@@ -4444,7 +4444,7 @@ impl BufferSnapshot {
                 continue;
             }
 
-            let mut all_brackets = Vec::new();
+            let mut all_brackets: Vec<(BracketMatch<usize>, bool)> = Vec::new();
             let mut opens = Vec::new();
             let mut color_pairs = Vec::new();
 
@@ -4488,26 +4488,133 @@ impl BufferSnapshot {
                     continue;
                 }
 
-                let index = all_brackets.len();
-                all_brackets.push(BracketMatch {
-                    open_range: open_range.clone(),
-                    close_range: close_range.clone(),
-                    newline_only: pattern.newline_only,
-                    syntax_layer_depth,
-                    color_index: None,
-                });
-
-                // Certain languages have "brackets" that are not brackets, e.g. tags. and such
-                // bracket will match the entire tag with all text inside.
-                // For now, avoid highlighting any pair that has more than single char in each bracket.
-                // We need to  colorize `<Element/>` bracket pairs, so cannot make this check stricter.
-                let should_color =
-                    !pattern.rainbow_exclude && (open_range.len() == 1 || close_range.len() == 1);
-                if should_color {
-                    opens.push(open_range.clone());
-                    color_pairs.push((open_range, close_range, index));
-                }
+                all_brackets.push((
+                    BracketMatch {
+                        open_range: open_range.clone(),
+                        close_range: close_range.clone(),
+                        newline_only: pattern.newline_only,
+                        syntax_layer_depth,
+                        color_index: None,
+                    },
+                    pattern.rainbow_exclude,
+                ));
             }
+
+            // Detect if the grammar produces "bogus" matches where one open is paired
+            // with multiple closes (common in markdown). Count occurrences of each open_range.
+            let mut open_counts: HashMap<(usize, usize), usize> = HashMap::default();
+            for (m, _) in &all_brackets {
+                *open_counts
+                    .entry((m.open_range.start, m.open_range.end))
+                    .or_default() += 1;
+            }
+            let has_bogus_matches = open_counts.values().any(|&count| count > 1);
+
+            if has_bogus_matches {
+                // Grammar is producing bogus matches. Use stack-based matching on unique
+                // opens/closes within the chunk to determine which pairs are properly nested.
+                let mut unique_opens: HashSet<(usize, usize)> = all_brackets
+                    .iter()
+                    .map(|(m, _)| (m.open_range.start, m.open_range.end))
+                    .filter(|(start, _)| chunk_range.contains(start))
+                    .collect();
+
+                let mut unique_closes: Vec<(usize, usize)> = all_brackets
+                    .iter()
+                    .map(|(m, _)| (m.close_range.start, m.close_range.end))
+                    .filter(|(start, _)| chunk_range.contains(start))
+                    .collect();
+                unique_closes.sort();
+                unique_closes.dedup();
+
+                // Some grammars (e.g. markdown) fail to capture individual open brackets,
+                // only capturing the first one in the document. For single-char brackets,
+                // infer missing opens by checking if the character before a close is a
+                // matching open bracket.
+                let bracket_pairs: &[(char, char)] =
+                    &[('[', ']'), ('(', ')'), ('{', '}'), ('<', '>')];
+                let mut inferred_opens: HashSet<(usize, usize)> = HashSet::default();
+                for &(close_start, close_end) in &unique_closes {
+                    if close_end - close_start == 1 && close_start > 0 {
+                        let inferred_open = (close_start - 1, close_start);
+                        if !unique_opens.contains(&inferred_open) {
+                            // Check if the characters match a bracket pair
+                            let close_char = self.text.chars_at(close_start).next();
+                            let open_char = self.text.reversed_chars_at(close_start).next();
+                            if let (Some(open_ch), Some(close_ch)) = (open_char, close_char) {
+                                if bracket_pairs.contains(&(open_ch, close_ch)) {
+                                    unique_opens.insert(inferred_open);
+                                    inferred_opens.insert(inferred_open);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut unique_opens: Vec<_> = unique_opens.into_iter().collect();
+                unique_opens.sort();
+
+                // Stack-based matching: for each close, match with the most recent unmatched open
+                let mut valid_pairs: HashSet<((usize, usize), (usize, usize))> = HashSet::default();
+                let mut open_stack: Vec<(usize, usize)> = Vec::new();
+                let mut open_idx = 0;
+
+                for close in unique_closes {
+                    // Push all opens that start before this close
+                    while open_idx < unique_opens.len() && unique_opens[open_idx].0 < close.0 {
+                        open_stack.push(unique_opens[open_idx]);
+                        open_idx += 1;
+                    }
+                    // Match with most recent open
+                    if let Some(open) = open_stack.pop() {
+                        valid_pairs.insert((open, close));
+
+                        // If this open was inferred (not from grammar), create a synthetic match
+                        if inferred_opens.contains(&open) {
+                            all_brackets.push((
+                                BracketMatch {
+                                    open_range: open.0..open.1,
+                                    close_range: close.0..close.1,
+                                    newline_only: false,
+                                    syntax_layer_depth: 0,
+                                    color_index: None,
+                                },
+                                false, // should_color = true (not rainbow_exclude)
+                            ));
+                        }
+                    }
+                }
+
+                // Filter to only properly matched pairs
+                all_brackets.retain(|(m, _)| {
+                    let open = (m.open_range.start, m.open_range.end);
+                    let close = (m.close_range.start, m.close_range.end);
+                    valid_pairs.contains(&(open, close))
+                });
+            }
+
+            let mut all_brackets: Vec<_> = all_brackets
+                .into_iter()
+                .enumerate()
+                .map(|(index, (bracket_match, rainbow_exclude))| {
+                    // Certain languages have "brackets" that are not brackets, e.g. tags. and such
+                    // bracket will match the entire tag with all text inside.
+                    // For now, avoid highlighting any pair that has more than single char in each bracket.
+                    // We need to  colorize `<Element/>` bracket pairs, so cannot make this check stricter.
+                    let should_color = !rainbow_exclude
+                        && (bracket_match.open_range.len() == 1
+                            || bracket_match.close_range.len() == 1);
+                    if should_color {
+                        opens.push(bracket_match.open_range.clone());
+                        color_pairs.push((
+                            bracket_match.open_range.clone(),
+                            bracket_match.close_range.clone(),
+                            index,
+                        ));
+                    }
+                    bracket_match
+                })
+                .collect();
 
             opens.sort_by_key(|r| (r.start, r.end));
             opens.dedup_by(|a, b| a.start == b.start && a.end == b.end);
